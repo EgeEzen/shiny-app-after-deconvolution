@@ -1,0 +1,595 @@
+library(DESeq2)
+library(RColorBrewer)
+library(pheatmap)
+library(tidyverse)
+library(ggplot2)
+library(apeglm)
+library(EnhancedVolcano)
+library(writexl)
+library(ggrepel)
+library(tidyr)
+library(limma)
+library(dplyr)
+library(biomaRt)
+library(ggthemr)
+library(ggsignif)
+library(envalysis)
+
+#Setting the working directory
+
+setwd("~/Desktop/PhD/2024 Second Term/deconvolution/deg/")
+
+
+# -------- DATA PREPARATION -----------
+
+# read the raw data
+count_data <- read.delim("~/Desktop/PhD/2024 Second Term/deconvolution/for_input/count_matrix_GSE89408.txt",row.names = 1)
+# filter rows with Total >= 5*ncol(207) = 1035
+count_data$Total <- rowSums(count_data[, 1:ncol(count_data)])
+count_data <- count_data[count_data$Total >= 1035, ]
+count_data$count_data <- NULL
+# read the metadata
+metadata <- read.csv("metadata.csv",row.names =1)
+
+# only get the pauci-immune condition
+metadata <- metadata[metadata$group == "RA" & metadata$ImmuneCategory == "Pauci-immune",]
+
+# get the count data columns only represented in metadata
+count_data <- count_data[,colnames(count_data) %in% rownames(metadata)]
+# save them for shiny app
+saveRDS(count_data, "count_data_pauci_immune.rds")
+saveRDS(metadata, "metadata_pauci_immune.rds")
+
+# create dds using sex as a covariant then get the normalized counts
+dds <- DESeqDataSetFromMatrix(countData = count_data, colData = metadata, design = ~ sex)
+dds <- estimateSizeFactors(dds)
+nrm_counts <- counts(dds, normalized = TRUE)
+saveRDS(nrm_counts, "nrm_counts_pauci_immune.rds")
+
+# -------- DATA PREPARATION OVER -----------
+
+#read rds
+count_data <- readRDS("within ra pauci/count_data_pauci_immune.rds")
+metadata <- readRDS("within ra pauci/metadata_pauci_immune.rds")
+nrm_counts <- readRDS("within ra pauci/nrm_counts_pauci_immune.rds")
+
+#select a gene
+selected_gene <- "RBPJ"
+
+# get selected gene expression
+selected_gene_expression <-  nrm_counts["RBPJ", ]  
+
+# define quantiles
+q25 <- quantile(selected_gene_expression, 0.25)  
+q75 <- quantile(selected_gene_expression, 0.75) 
+
+# assign groups
+metadata$selected_gene_expression <- ifelse(selected_gene_expression <= q25, "Low",
+                              ifelse(selected_gene_expression >= q75, "High", NA))
+
+# remove other samples
+metadata_selected_gene <- metadata[!is.na(metadata$selected_gene_expression),]
+metadata_selected_gene$selected_gene_expression <- factor(metadata_selected_gene$selected_gene_expression, c("Low","High"))
+count_data_selected_gene <- count_data[,colnames(count_data) %in% rownames(metadata_selected_gene)]
+
+# creating the DESeq2 object
+# sex as a batch effect -> this only effects the differential gene expression (logfold changes, padj etc)
+# for visualization batch effect remover will be used (only for visualization, not for d.g.e. analysis)
+dds <- DESeqDataSetFromMatrix(countData = count_data_selected_gene,
+                              colData =  metadata_selected_gene,
+                              design = ~ sex + selected_gene_expression) 
+                                                    
+#it will give warning message, ignore it (about the base, it will automatically convert to factors)
+
+#factor level is set here, this means the base
+dds$condition <- relevel(dds$selected_gene_expression, ref = "Low") 
+
+#calculating the median of ratios, and adding to our object 
+#(this is already done in while the deseq2 object, but you can use these values separately)
+dds <- estimateSizeFactors(dds)
+
+#extracting the normalized counts from object
+new_nrm_counts <- counts(dds, normalized = TRUE)
+
+# Extracting the transformed values (DESEQ2 says blind should be false to reduce noise for downstream analysis)
+# DESEQ2 Manual says that bias introduced in blind=FALSE argument is not cruical
+vsd <- vst(dds, blind=FALSE) 
+
+#computing pairwise correlation values, first create a matrix from vsd object
+vsd_mat <- assay(vsd)
+
+#you can also remove the batch effects here for visualization 
+vsd_copy <- vsd
+mat_copy <- assay(vsd_copy)
+mm <- model.matrix(~selected_gene_expression, colData(vsd_copy))
+mat_copy <- removeBatchEffect(mat_copy, batch=vsd_copy$sex, design=mm)
+assay(vsd_copy) <- mat_copy
+#also for normalized counts
+nrm_counts_copy <- new_nrm_counts
+nrm_counts_copy <- removeBatchEffect(nrm_counts_copy,batch=vsd_copy$sex, design=mm)
+
+#Doing PCA Analysis with the batch effect removed 
+pcaData<-plotPCA(vsd_copy, intgroup="selected_gene_expression",returnData=TRUE)
+
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+pcaData$group <- metadata_selected_gene$selected_gene_expression
+
+p <- ggplot(pcaData, aes(PC1, PC2, color=group)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  scale_color_brewer(palette="Set2") + 
+  coord_fixed() + labs(title= paste0("PCA Plot on\n", selected_gene, " Expression")) +
+ # geom_label_repel(fontface = "bold", nudge_x = 1, show.legend = FALSE) +
+  theme_publish() +
+  theme(legend.position = "right") 
+p
+
+ggsave(
+  plot = p,
+  filename = paste0(selected_gene,"_PCA_plot.png"),
+  bg = "transparent",
+  width = 7, height = 7)
+
+#finally doing the DESeq analysis, dds is now the deseq2 object
+dds <- DESeq(dds)
+
+#extracting the results
+result <- results(dds, alpha = 0.05)
+
+#Row names are extracted to gene_id column
+result$gene_id <- rownames(result)
+#extracting this results to an excel file
+
+#write_xlsx(as.data.frame(result),"deseq2_genes.xlsx")
+
+# getting the coefficients for the log shrinkage 
+resultsNames(dds)
+
+# log shrinkage, apeglm method will be used (2018 paper)
+results_vs <- lfcShrink(dds,
+                         coef="selected_gene_expression_High_vs_Low",type="apeglm")
+
+#results to save 
+results_to_save <- as.data.frame(results_vs)
+results_to_save$gene <- rownames(results_to_save)
+# then you can save this file
+write_xlsx(results_to_save,paste0(selected_gene,"_results_vs_within_ra.xlsx"))
+#------------#
+
+# from now on continue the analysis with the shrinkage version of the results
+
+#only getting significants and ordering (FDR 0.05, fc 1.5 is picked here)
+resSig <- results_vs[order(results_vs$padj),]
+resSig <- subset(resSig, padj <= 0.05)
+resSig_with_fc1 <- subset(resSig, ((log2FoldChange >= 0.585) | (log2FoldChange <= -0.585) ))
+
+#for tnf vs nontnf be removed normalized counts
+resSig_with_be_removed_normalized_counts <- merge(as.data.frame(resSig), as.data.frame(nrm_counts_copy), by="row.names")
+
+#exporting as xlsx
+write_xlsx(resSig_with_be_removed_normalized_counts,"results_vs_sig_with_be_removed_normalized_counts.xlsx")
+
+#resSig with the batch effect removed vsd counts -> this is useful for visualization
+resSig_with_be_removed_vsd_counts <- merge(as.data.frame(resSig), as.data.frame(mat_copy), by="row.names")
+resSig_with_fc1_with_be_removed_vsd_counts <- merge(as.data.frame(resSig_with_fc1), as.data.frame(mat_copy), by="row.names")
+
+# #if doing it for immunecellproportions
+# metadata <- metadata[order(metadata$ImmuneCellProportion),]  # Get ordered sample names
+# colnames_copy <-colnames(resSig_with_fc1_with_be_removed_vsd_counts)
+# resSig_with_fc1_with_be_removed_vsd_counts <- resSig_with_fc1_with_be_removed_vsd_counts[, c(colnames_copy[1:6],rownames(metadata))]  # Reorder matrix columns
+# resSig_with_fc4_with_be_removed_vsd_counts <- resSig_with_fc4_with_be_removed_vsd_counts[, c(colnames_copy[1:6],rownames(metadata))]
+
+# draw heatmap
+custom_colors <- colorRampPalette(c("blue", "white", "red"))(50)
+
+for_heatmap <- resSig_with_fc1_with_be_removed_vsd_counts[order(resSig_with_fc1_with_be_removed_vsd_counts$padj),][1:50,]
+rownames(for_heatmap) <- for_heatmap$Row.names 
+for_heatmap <- for_heatmap[,7:ncol(for_heatmap),drop=FALSE]
+
+p1 <- pheatmap(for_heatmap,
+               cluster_rows=TRUE, show_rownames=TRUE,scale = "row",color = custom_colors,
+               show_colnames = FALSE,
+              cluster_cols=TRUE, annotation_col=metadata_selected_gene[,"selected_gene_expression",drop=FALSE],width=10,height=10, 
+              main = paste0("Within Pauci-immune RA\n", selected_gene, " Differential Expression") ,treeheight_row = 0) 
+
+ggsave(
+  plot = p1,
+  filename = paste0(selected_gene, "_heatmap_resSig.png"),
+  bg = "transparent",
+  width = 10, height = 8
+)
+
+# --------- draw the volcano plot------ #
+
+results_vs_df <- as.data.frame(results_vs)
+results_vs_df$pvalue <- ifelse(is.na(results_vs_df$pvalue), 1, results_vs_df$pvalue)
+results_vs_df$padj <- ifelse(is.na(results_vs_df$padj), 1, results_vs_df$padj)
+
+
+threshold_for_lfc <- 0.585
+#volcano plot drawing starts here:
+#add a column to classify points as significant or not
+results_vs_df$Classification <- with(results_vs_df, ifelse(padj <= 0.05 & log2FoldChange >= threshold_for_lfc, "Upregulated", 
+                                                                     ifelse(padj <= 0.05 & log2FoldChange <= -threshold_for_lfc, "Downregulated", 
+                                                                            "Not Significant")))
+#calculating the -log10(padj)
+results_vs_df$log_adjP <- -log10(results_vs_df$padj)
+
+#selecting points for geom text label
+label_data <- subset(results_vs_df, (log2FoldChange >= threshold_for_lfc | log2FoldChange <= -threshold_for_lfc) & Classification != "Not Significant" )
+
+top_25_up <- label_data %>% filter(Classification == "Upregulated") %>% arrange(desc(log2FoldChange)) %>% head(25)
+top_25_down <- label_data %>% filter(Classification == "Downregulated") %>% arrange(log2FoldChange) %>% head(25)
+label_data <- bind_rows(top_25_up, top_25_down)
+
+#rownames(label_data) <- NULL
+#label_data$rownames <- rownames(label_data)
+#label_data <- label_data[,c(5,6,19,21,22)]
+
+p <- ggplot(results_vs_df[rownames(results_vs_df) != selected_gene, ], aes(x = log2FoldChange, y = log_adjP)) +
+  geom_point(aes(color = Classification), size = 1,alpha=0.8) + #alpha 0.5-0.8 looks "cool"
+  scale_color_manual(values = c("Upregulated" = "#EE4E4E", "Downregulated" = "#2A629A", "Not Significant" = "lightgray")) +
+  geom_vline(xintercept = c(-threshold_for_lfc,threshold_for_lfc), linetype = "dashed", color = "black") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "black") +
+  labs(
+    title = paste0(selected_gene ,"-Differentially Expressed Genes\nWithin Pauci-immune RA"), 
+    x = "Log2 Fold Change",
+    y = "-log10(Adjusted P-Value)",
+    fill = "Classification"
+  ) +   # Increase plot margins if necessary
+  ylim(0,NA) +
+  geom_label_repel(
+    data = label_data,
+    aes(label = rownames(label_data)),
+    box.padding = unit(0.1, "lines"),
+    segment.color = "#2B2A4C",
+    max.overlaps= 50
+  ) +
+  guides(color = guide_legend(title = "Differential Expression", override.aes = list(size = 3)),alpha= "none") +
+  theme_publish()
+
+p
+
+ggsave(
+  plot = p,
+  filename = "volcanoPlot_lf1.png",
+  bg = "transparent",
+  width = 10, height = 6
+)
+
+# ------ draw dotplot for a specific gene ------ #
+
+gene_of_interest <- "HES1"
+nrm_counts_filtered <- nrm_counts_copy[rownames(nrm_counts_copy) == gene_of_interest,,drop=FALSE]
+nrm_counts_filtered <- as.data.frame(t(nrm_counts_filtered))
+nrm_counts_filtered <- rownames_to_column(nrm_counts_filtered, var = "Sample")
+nrm_counts_filtered$Condition <- metadata_selected_gene$selected_gene_expression
+colnames(nrm_counts_filtered) <- c("Sample","Counts","Condition") 
+nrm_counts_filtered$Condition <- factor(nrm_counts_filtered$Condition, labels = c("Low","High"))
+
+p <- ggplot(nrm_counts_filtered, aes(x = Condition, y = Counts, fill = Condition)) +
+  geom_violin(trim = TRUE, alpha = 0.8) + 
+  geom_jitter(width = 0.2, size = 1, alpha = 0.6, color = "black") +
+  labs(title = paste0("Gene Expression of\n", gene_of_interest," in Pauci-immune RA with\n", selected_gene," Expression Groups"), 
+       x = "Condition", y = "Normalized Counts") +
+  theme_publish() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),plot.title = element_text(size = 12),  
+        legend.position = "none") +
+  ylim(NA,max(nrm_counts_filtered$Counts) * 1.2)
+
+p
+
+checking_condition <- (results_vs_df[rownames(results_vs_df) == gene_of_interest,,drop=FALSE ])$padj
+if (checking_condition <= 0.05){
+  p <- p + geom_signif(comparisons = list(c("Low", "High")),
+                       annotations = "*",  # Star for significance
+                       y_position = max(nrm_counts_filtered$Counts) * 1.05, 
+                       tip_length = 0.02, textsize = 5)
+}
+
+p
+ggsave(
+  plot = p,
+  filename = paste0("dotplot_of_",gene_of_interest,"in_",selected_gene,".png"),
+  bg = "transparent",
+  width = 5, height = 7
+)
+
+# ---------- draw correlation plot for a specific gene for immunecellproportions -------- #
+gene_of_interest <- "HES1"
+vsd_counts_filtered <- mat_copy[gene_of_interest,,drop=FALSE]
+vsd_counts_filtered <- as.data.frame(t(vsd_counts_filtered))
+vsd_counts_filtered <- vsd_counts_filtered[rownames(metadata),,drop=FALSE]
+vsd_counts_filtered$ImmuneCellProportion <- metadata$ImmuneCellProportion
+colnames(vsd_counts_filtered) <- c("Counts","ImmuneCellProportion")
+
+#correlation coefficient R
+cor_value <- cor(vsd_counts_filtered$Counts, vsd_counts_filtered$ImmuneCellProportion, method = "pearson")
+
+#plotting
+ggplot(vsd_counts_filtered, aes(x = ImmuneCellProportion, y = Counts)) +
+  geom_point(color = "#71BBB2", size = 3, alpha = 0.6) +
+  geom_smooth(method = "lm", color = "#FBFFE4", fill = "#27445D") +
+  labs(title = paste("Expression of", gene_of_interest, "\nvs Immune Cell Proportion"),
+       x = "Immune Cell Proportion",
+       y = "Gene Expression\n(log-transformed)") +
+  theme_publish() +
+  annotate("text", x = 0.2, y = max(vsd_counts_filtered$Counts)*1.03, 
+           label = paste("Pearson R =", round(cor_value, 3)), 
+           color = "black", size = 4)
+
+# --------- heatmap from selected genes ------- #
+
+selected_genes <- c("RBPJ","AGAP2-AS1","ZFP36L1")
+#mat_copy_filtered <- vsd_mat[rownames(vsd_mat) %in% selected_genes, ,drop=FALSE] #for healthy vs ra
+mat_copy_filtered <- mat_copy[rownames(mat_copy) %in% selected_genes, ,drop=FALSE]
+
+#for the TNF vs nonTNF you have re-order the columns
+metadata$condition <- factor(metadata$condition, levels = c("Non_stimulated", "Stimulated"))
+ordered_samples <- rownames(metadata)[order(metadata$condition)]  # Get ordered sample names
+mat_copy_filtered <- mat_copy_filtered[, ordered_samples]  # Reorder matrix columns
+
+# draw heatmap
+custom_colors <- colorRampPalette(c("blue", "white", "red"))(10)
+
+p1 <- pheatmap(mat_copy_filtered, cluster_rows=TRUE, show_rownames=TRUE,show_colnames = FALSE,scale = "row",color = custom_colors,
+               cluster_cols=FALSE, annotation_col=metadata[,"group",drop=FALSE],width=10,height=10, #group or condition
+               main = "Heatmap of Selected Genes\nin RA and Healthy",treeheight_row = 0)
+
+ggsave(
+  plot = p1,
+  filename = "heatmap_vsd.png",
+  bg = "transparent",
+  width = 7, height = 2
+)
+
+#----------- Pathway Analysis ---------- #
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ReactomePA)
+library(enrichplot)
+library(DOSE)
+
+# convert from hgnc symbols to entrezids, unfortunately not every symbol is represented
+DEG_entrez <- bitr(resSig_with_fc1_with_be_removed_vsd_counts$Row.names, fromType="SYMBOL", toType="ENTREZID", OrgDb=org.Hs.eg.db)
+
+# for GEO pathway analysis
+
+go_bp <- enrichGO(
+  gene = DEG_entrez$ENTREZID, 
+  OrgDb = org.Hs.eg.db, 
+  keyType = "ENTREZID", 
+  ont = "BP",  # BP = Biological Process
+  pAdjustMethod = "BH", 
+  pvalueCutoff = 0.05, 
+  qvalueCutoff = 0.05
+)
+
+go_mf <- enrichGO(
+  gene = DEG_entrez$ENTREZID, 
+  OrgDb = org.Hs.eg.db, 
+  keyType = "ENTREZID", 
+  ont = "MF",  # MF = Molecular Function
+  pAdjustMethod = "BH", 
+  pvalueCutoff = 0.05, 
+  qvalueCutoff = 0.05
+)
+
+
+dot_plot_geo_df <- function(go_geo,top_integer) {
+  go_df <- as.data.frame(go_geo@result) %>%
+    filter(p.adjust < 0.05) %>%  # Keep significant terms
+    arrange(p.adjust) %>%
+    head(top_integer)  # Select top x GO terms
+  
+  go_df <- go_df %>%
+    rename(Term = Description, 
+           pval = p.adjust, 
+           Count = Count)
+  return(go_df)
+  }
+dot_plot_geo <- function(go_geo_df,term_string){
+  p <- ggplot(go_geo_df, aes(x = reorder(Term, -Count), y = Count, fill = pval)) +
+    geom_bar(stat = "identity", alpha = 0.9, width = 0.7) +
+    geom_text(aes(label = Count), hjust = -0.3, size = 5) +  # Add count labels
+    scale_fill_gradient(low = "#4575b4", high = "#d73027",limits = c(0,max(go_geo_df$pval))) +  # Color based on p-value
+    coord_flip() +  
+    labs(title = paste0("Top ", nrow(go_geo_df) ," GO ",term_string),
+         x = "GO Term", 
+         y = "Gene Count",
+         fill = "p-value") +
+    theme_publish() +
+    theme(axis.text.y = element_text(size = 12), 
+          plot.title = element_text(size = 16, face = "bold"),
+          legend.position = "bottom",legend.text = element_text(angle = 45))
+  return(p)
+}
+
+go_bp_df <- dot_plot_geo_df(go_bp, 20)
+#go_bp_df["GO:0002460","Term"] <- "adaptive immune response based on somatic recombination"
+  
+p_dotplot_bp <- dot_plot_geo(go_bp_df,"Biological Processes")
+p_dotplot_bp
+
+ggsave(
+  plot = p_dotplot_bp,
+  filename = "go_bp_top20.png",
+  bg = "transparent",
+  width = 14, height = 8
+)
+
+go_mf_df <- dot_plot_geo_df(go_mf, 20)
+
+p_dotplot_mf <- dot_plot_geo(go_mf_df,"Molecular Functions")
+p_dotplot_mf
+
+ggsave(
+  plot = p_dotplot_mf,
+  filename = "go_mf_top20.png",
+  bg = "transparent",
+  width = 15, height = 8
+)
+
+#for KEGG pathway 
+
+kegg_enrich <- enrichKEGG(
+  gene = DEG_entrez$ENTREZID, 
+  organism = "hsa",  # "hsa" for humans
+  pvalueCutoff = 0.05
+)
+
+dot_plot_kegg <- function(kegg_result, top_integer) {
+  
+  kegg_df <- as.data.frame(kegg_result@result) %>%
+    filter(p.adjust < 0.05) %>%  
+    arrange(p.adjust) %>%
+    head(top_integer) 
+  
+  # Rename columns for better readability
+  kegg_df <- kegg_df %>%
+    rename(Pathway = Description, 
+           pval = p.adjust, 
+           Count = Count)
+  
+  # Create the plot
+  p <- ggplot(kegg_df, aes(x = reorder(Pathway, -Count), y = Count, fill = pval)) +
+    geom_bar(stat = "identity", alpha = 0.9, width = 0.7) +
+    geom_text(aes(label = Count), hjust = -0.3, size = 5) +  # Add count labels
+    scale_fill_gradient(low = "#4575b4", high = "#d73027", limits = c(0, max(kegg_df$pval))) +  
+    coord_flip() +  # Flip for better readability
+    labs(title = "Top KEGG Pathways",
+         x = "KEGG Pathway", 
+         y = "Gene Count",
+         fill = "p-value") +
+    theme_publish() +
+    theme(axis.text.y = element_text(size = 12), 
+          plot.title = element_text(size = 16, face = "bold"),
+          legend.position = "bottom",legend.text = element_text(angle = 45))
+  
+  return(list(plot = p, data = kegg_df))
+}
+
+# Run the function and unpack the results
+result_kegg <- dot_plot_kegg(kegg_enrich, 20)
+p_dotplot_kegg <- result_kegg$plot
+kegg_df <- result_kegg$data
+p_dotplot_kegg
+
+ggsave(
+  plot = p_dotplot_kegg,
+  filename = "kegg_20.png",
+  bg = "transparent",
+  width = 15, height = 8
+)
+
+
+#reactome pathway analysis---
+reactome_enrich <- enrichPathway(
+  gene = DEG_entrez$ENTREZID, 
+  pvalueCutoff = 0.05, 
+  readable = TRUE, 
+  organism = "human"
+)
+
+dot_plot_reactome <- function(reactome_result, top_integer) {
+  
+  reactome_df <- as.data.frame(reactome_result@result) %>%
+    filter(p.adjust < 0.05) %>%
+    arrange(p.adjust) %>%
+    head(top_integer) %>%
+    rename(Pathway = Description, pval = p.adjust, Count = Count)
+  
+  # Create the plot
+  p <- ggplot(reactome_df, aes(x = reorder(Pathway, -Count), y = Count, fill = pval)) +
+    geom_bar(stat = "identity", alpha = 0.9, width = 0.7) +
+    geom_text(aes(label = Count), hjust = -0.3, size = 5) +  # Add count labels
+    scale_fill_gradient(low = "#4575b4", high = "#d73027", limits = c(0, max(reactome_df$pval))) +  
+    coord_flip() +  # Flip for better readability
+    labs(title = "Top Reactome Pathways",
+         x = "Reactome Pathway", 
+         y = "Gene Count",
+         fill = "p-value") +
+    theme_publish() +
+    theme(axis.text.y = element_text(size = 12), 
+          plot.title = element_text(size = 16, face = "bold"),
+          legend.position = "bottom",legend.text = element_text(angle = 45))
+  
+  return(list(plot = p, data = reactome_df))
+}
+
+# Run the function and unpack the results
+results_reactome <- dot_plot_reactome(reactome_enrich, 20)
+p_dotplot_reactome <- results_reactome$plot
+reactome_df <- results_reactome$data
+p_dotplot_reactome
+
+ggsave(
+  plot = p_dotplot_reactome,
+  filename = "reactome_20.png",
+  bg = "transparent",
+  width = 15, height = 8
+)
+
+# Gene set enrichment analysis GSEA
+
+merged_df <- merge(DEG_entrez, resSig_with_fc1_with_be_removed_vsd_counts, by.x = "SYMBOL", by.y = "Row.names", all.x =TRUE)
+
+GSEA_gene_list <- merged_df$log2FoldChange  
+names(GSEA_gene_list) <- merged_df$ENTREZID
+GSEA_gene_list <- sort(GSEA_gene_list, decreasing = TRUE)
+
+gsea_kegg <- gseKEGG(
+  geneList = GSEA_gene_list, 
+  organism = "hsa", 
+  pvalueCutoff = 0.05,
+  eps = 0
+)
+#the warning is fine only 0.04 percent 
+
+dot_plot_GSEA <- function(gsea_result, top_integer) {
+  
+  gsea_df <- as.data.frame(gsea_result@result) %>%
+    filter(p.adjust < 0.05) %>%
+    arrange(p.adjust) %>%
+    head(top_integer) %>%
+    rename(Pathway = Description, pval = p.adjust, NES = NES, Count = setSize)
+  
+  # Create the plot
+  p <- ggplot(gsea_df, aes(x = reorder(Pathway, -NES), y = NES, fill = pval)) +
+    geom_bar(stat = "identity", alpha = 0.9, width = 0.7) +
+    geom_text(aes(label = round(NES, 2)), hjust = -0.3, size = 5) +  
+    scale_fill_gradient(low = "#4575b4", high = "#d73027", limits = c(0, max(gsea_df$pval))) +  
+    coord_flip() +  
+    labs(title = "Top GSEA KEGG Pathways",
+         x = "KEGG Pathway", 
+         y = "Normalized Enrichment Score (NES)",
+         fill = "p-value") +
+    theme_publish() +
+    theme(axis.text.y = element_text(size = 12), 
+          plot.title = element_text(size = 16, face = "bold"),
+          legend.position = "bottom", legend.text = element_text(angle = 45))
+  
+  return(list(plot = p, data = gsea_df))
+}
+
+# Run the function
+results_gsea <- dot_plot_GSEA(gsea_kegg, 20)
+p_dotplot_gsea <- results_gsea$plot
+gsea_df <- results_gsea$data
+p_dotplot_gsea
+
+# Save the plot
+ggsave(
+  plot = p_dotplot_gsea,
+  filename = "GSEA_KEGG_20.png",
+  bg = "transparent",
+  width = 15, height = 8
+)
+
+ridgeplot(gsea_kegg, showCategory = 20) + 
+  theme_publish() + 
+  ggtitle("GSEA KEGG Enrichment Scores")
+
